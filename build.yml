@@ -1,0 +1,120 @@
+name: Build FPS Monitor APK
+on: [push, workflow_dispatch]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: android-actions/setup-android@v3
+      - run: sdkmanager "platforms;android-34" "build-tools;34.0.0"
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+      - name: Create Android project
+        run: |
+          mkdir -p .
+          cat > settings.gradle <<'__EOF__'
+          pluginManagement {
+              repositories { google(); mavenCentral(); gradlePluginPortal() }
+          }
+          dependencyResolutionManagement {
+              repositories { google(); mavenCentral() }
+          }
+          rootProject.name = 'FPSMonitor'
+          include ':app'
+          __EOF__
+          mkdir -p .
+          cat > build.gradle <<'__EOF__'
+          plugins {
+              id 'com.android.application' version '8.5.2' apply false
+          }
+          __EOF__
+          mkdir -p .
+          cat > gradle.properties <<'__EOF__'
+          org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8
+          android.nonTransitiveRClass=true
+          __EOF__
+          mkdir -p app
+          cat > app/build.gradle <<'__EOF__'
+          plugins {
+              id 'com.android.application'
+          }
+          android {
+              namespace 'com.max.fpsmonitor'
+              compileSdk 34
+              defaultConfig {
+                  applicationId 'com.max.fpsmonitor'
+                  minSdk 24
+                  targetSdk 34
+                  versionCode 1
+                  versionName '1.0'
+              }
+              buildTypes {
+                  release { minifyEnabled false }
+              }
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_17
+                  targetCompatibility JavaVersion.VERSION_17
+              }
+          }
+          __EOF__
+          mkdir -p app/src/main
+          cat > app/src/main/AndroidManifest.xml <<'__EOF__'
+          <?xml version="1.0" encoding="utf-8"?>
+          <!-- No INTERNET permission on purpose: the app cannot go online, everything is bundled. -->
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <application
+                  android:label="FPS Monitor"
+                  android:allowBackup="false"
+                  android:theme="@android:style/Theme.Material.NoActionBar.Fullscreen">
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|keyboardHidden">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          __EOF__
+          mkdir -p app/src/main/java/com/max/fpsmonitor
+          cat > app/src/main/java/com/max/fpsmonitor/MainActivity.java <<'__EOF__'
+          package com.max.fpsmonitor;
+
+          import android.app.Activity;
+          import android.os.Bundle;
+          import android.view.WindowManager;
+          import android.webkit.WebSettings;
+          import android.webkit.WebView;
+
+          public class MainActivity extends Activity {
+              private WebView web;
+
+              @Override
+              protected void onCreate(Bundle b) {
+                  super.onCreate(b);
+                  getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+                  web = new WebView(this);
+                  WebSettings s = web.getSettings();
+                  s.setJavaScriptEnabled(true);
+                  s.setDomStorageEnabled(true);
+                  web.setBackgroundColor(0xFF000000);
+                  web.loadUrl("file:///android_asset/index.html");
+                  setContentView(web);
+              }
+          }
+          __EOF__
+          mkdir -p app/src/main/assets
+          cp "$(ls *.html | head -1)" app/src/main/assets/index.html
+      - name: Build APK
+        run: gradle assembleDebug --no-daemon
+      - uses: actions/upload-artifact@v4
+        with:
+          name: FPSMonitor-APK
+          path: app/build/outputs/apk/debug/app-debug.apk
