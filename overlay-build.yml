@@ -1,0 +1,466 @@
+name: Build FPS Monitor Overlay APK
+on: [push, workflow_dispatch]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Install Android SDK platform
+        run: |
+          yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses > /dev/null || true
+          $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager "platforms;android-34" "build-tools;34.0.0" || true
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+      - name: Create Android project
+        run: |
+          mkdir -p .
+          cat > settings.gradle <<'__EOF__'
+          pluginManagement {
+              repositories { google(); mavenCentral(); gradlePluginPortal() }
+          }
+          dependencyResolutionManagement {
+              repositories { google(); mavenCentral() }
+          }
+          rootProject.name = 'FPSMonitor'
+          include ':app'
+          __EOF__
+          mkdir -p .
+          cat > build.gradle <<'__EOF__'
+          plugins {
+              id 'com.android.application' version '8.5.2' apply false
+          }
+          __EOF__
+          mkdir -p .
+          cat > gradle.properties <<'__EOF__'
+          org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8
+          android.nonTransitiveRClass=true
+          __EOF__
+          mkdir -p app
+          cat > app/build.gradle <<'__EOF__'
+          plugins {
+              id 'com.android.application'
+          }
+          android {
+              namespace 'com.max.fpsmonitor'
+              compileSdk 34
+              defaultConfig {
+                  applicationId 'com.max.fpsmonitor'
+                  minSdk 24
+                  targetSdk 34
+                  versionCode 1
+                  versionName '1.0'
+              }
+              buildTypes {
+                  release { minifyEnabled false }
+              }
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_17
+                  targetCompatibility JavaVersion.VERSION_17
+              }
+          }
+          __EOF__
+          mkdir -p app/src/main
+          cat > app/src/main/AndroidManifest.xml <<'__EOF__'
+          <?xml version="1.0" encoding="utf-8"?>
+          <!-- No INTERNET permission on purpose: the app cannot go online. -->
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+              <application
+                  android:label="FPS Monitor"
+                  android:allowBackup="false"
+                  android:theme="@android:style/Theme.Material.NoActionBar.Fullscreen">
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|keyboardHidden">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+                  <service
+                      android:name=".OverlayService"
+                      android:exported="false"
+                      android:foregroundServiceType="specialUse">
+                      <property
+                          android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                          android:value="fps_monitor_overlay" />
+                  </service>
+              </application>
+          </manifest>
+          __EOF__
+          mkdir -p app/src/main/java/com/max/fpsmonitor
+          cat > app/src/main/java/com/max/fpsmonitor/MainActivity.java <<'__EOF__'
+          package com.max.fpsmonitor;
+
+          import android.app.Activity;
+          import android.content.Intent;
+          import android.net.Uri;
+          import android.os.Build;
+          import android.os.Bundle;
+          import android.provider.Settings;
+          import android.view.WindowManager;
+          import android.webkit.JavascriptInterface;
+          import android.webkit.WebSettings;
+          import android.webkit.WebView;
+
+          public class MainActivity extends Activity {
+              private WebView web;
+
+              @Override
+              protected void onCreate(Bundle b) {
+                  super.onCreate(b);
+                  getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+                  web = new WebView(this);
+                  WebSettings s = web.getSettings();
+                  s.setJavaScriptEnabled(true);
+                  s.setDomStorageEnabled(true);
+                  web.setBackgroundColor(0xFF000000);
+                  web.addJavascriptInterface(new Bridge(), "Android");
+                  web.loadUrl("file:///android_asset/index.html");
+                  setContentView(web);
+              }
+
+              public class Bridge {
+                  @JavascriptInterface
+                  public void start() {
+                      runOnUiThread(new Runnable() {
+                          @Override
+                          public void run() {
+                              if (!Settings.canDrawOverlays(MainActivity.this)) {
+                                  Intent p = new Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                                          Uri.parse("package:" + getPackageName()));
+                                  startActivity(p);
+                                  return;
+                              }
+                              Intent i = new Intent(MainActivity.this, OverlayService.class);
+                              if (Build.VERSION.SDK_INT >= 26) {
+                                  startForegroundService(i);
+                              } else {
+                                  startService(i);
+                              }
+                              moveTaskToBack(true);
+                          }
+                      });
+                  }
+
+                  @JavascriptInterface
+                  public void stop() {
+                      runOnUiThread(new Runnable() {
+                          @Override
+                          public void run() {
+                              stopService(new Intent(MainActivity.this, OverlayService.class));
+                          }
+                      });
+                  }
+              }
+          }
+          __EOF__
+          mkdir -p app/src/main/java/com/max/fpsmonitor
+          cat > app/src/main/java/com/max/fpsmonitor/OverlayService.java <<'__EOF__'
+          package com.max.fpsmonitor;
+
+          import android.app.Notification;
+          import android.app.NotificationChannel;
+          import android.app.NotificationManager;
+          import android.app.PendingIntent;
+          import android.app.Service;
+          import android.content.Intent;
+          import android.content.pm.ServiceInfo;
+          import android.graphics.PixelFormat;
+          import android.os.Build;
+          import android.os.IBinder;
+          import android.view.Gravity;
+          import android.view.MotionEvent;
+          import android.view.ScaleGestureDetector;
+          import android.view.View;
+          import android.view.WindowManager;
+          import android.webkit.WebSettings;
+          import android.webkit.WebView;
+
+          public class OverlayService extends Service {
+              private WindowManager wm;
+              private WebView web;
+              private WindowManager.LayoutParams lp;
+
+              @Override
+              public IBinder onBind(Intent intent) {
+                  return null;
+              }
+
+              @Override
+              public int onStartCommand(Intent intent, int flags, int startId) {
+                  if (intent != null && "stop".equals(intent.getAction())) {
+                      stopSelf();
+                      return START_NOT_STICKY;
+                  }
+                  Notification.Builder nb;
+                  if (Build.VERSION.SDK_INT >= 26) {
+                      NotificationChannel ch = new NotificationChannel("ov", "Overlay", NotificationManager.IMPORTANCE_LOW);
+                      ((NotificationManager) getSystemService(NOTIFICATION_SERVICE)).createNotificationChannel(ch);
+                      nb = new Notification.Builder(this, "ov");
+                  } else {
+                      nb = new Notification.Builder(this);
+                  }
+                  Intent st = new Intent(this, OverlayService.class).setAction("stop");
+                  PendingIntent pi = PendingIntent.getService(this, 0, st,
+                          PendingIntent.FLAG_IMMUTABLE | PendingIntent.FLAG_UPDATE_CURRENT);
+                  Notification n = nb.setContentTitle("FPS Monitor overlay is on")
+                          .setContentText("Tap this notification to stop it")
+                          .setSmallIcon(android.R.drawable.ic_dialog_info)
+                          .setContentIntent(pi)
+                          .build();
+                  if (Build.VERSION.SDK_INT >= 34) {
+                      startForeground(1, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE);
+                  } else {
+                      startForeground(1, n);
+                  }
+                  if (web == null) {
+                      show();
+                  }
+                  return START_NOT_STICKY;
+              }
+
+              private void show() {
+                  wm = (WindowManager) getSystemService(WINDOW_SERVICE);
+                  final float d = getResources().getDisplayMetrics().density;
+                  final int sw = getResources().getDisplayMetrics().widthPixels;
+                  final float asp = 0.52f;
+                  int w = (int) (340 * d);
+                  int type = Build.VERSION.SDK_INT >= 26
+                          ? WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
+                          : WindowManager.LayoutParams.TYPE_PHONE;
+                  lp = new WindowManager.LayoutParams(w, (int) (w * asp), type,
+                          WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+                                  | WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS
+                                  | WindowManager.LayoutParams.FLAG_HARDWARE_ACCELERATED,
+                          PixelFormat.TRANSLUCENT);
+                  lp.gravity = Gravity.TOP | Gravity.START;
+                  lp.x = (int) (10 * d);
+                  lp.y = (int) (60 * d);
+                  web = new WebView(this);
+                  web.setBackgroundColor(0);
+                  WebSettings s = web.getSettings();
+                  s.setJavaScriptEnabled(true);
+                  s.setDomStorageEnabled(true);
+                  web.loadUrl("file:///android_asset/index.html?overlay=1");
+                  final ScaleGestureDetector sg = new ScaleGestureDetector(this,
+                          new ScaleGestureDetector.SimpleOnScaleGestureListener() {
+                              @Override
+                              public boolean onScale(ScaleGestureDetector g) {
+                                  int nw = Math.round(lp.width * g.getScaleFactor());
+                                  nw = Math.max((int) (140 * d), Math.min(nw, sw));
+                                  lp.width = nw;
+                                  lp.height = Math.round(nw * asp);
+                                  wm.updateViewLayout(web, lp);
+                                  return true;
+                              }
+                          });
+                  web.setOnTouchListener(new View.OnTouchListener() {
+                      float sx, sy;
+                      int ox, oy;
+                      boolean rb = true;
+
+                      @Override
+                      public boolean onTouch(View v, MotionEvent e) {
+                          sg.onTouchEvent(e);
+                          if (e.getPointerCount() > 1 || sg.isInProgress()) {
+                              rb = true;
+                              return true;
+                          }
+                          if (e.getActionMasked() == MotionEvent.ACTION_DOWN || rb) {
+                              sx = e.getRawX();
+                              sy = e.getRawY();
+                              ox = lp.x;
+                              oy = lp.y;
+                              rb = false;
+                              return true;
+                          }
+                          if (e.getActionMasked() == MotionEvent.ACTION_MOVE) {
+                              lp.x = ox + Math.round(e.getRawX() - sx);
+                              lp.y = oy + Math.round(e.getRawY() - sy);
+                              wm.updateViewLayout(web, lp);
+                          }
+                          return true;
+                      }
+                  });
+                  wm.addView(web, lp);
+              }
+
+              @Override
+              public void onDestroy() {
+                  if (web != null && wm != null) {
+                      wm.removeView(web);
+                      web.destroy();
+                      web = null;
+                  }
+                  super.onDestroy();
+              }
+          }
+          __EOF__
+          mkdir -p app/src/main/assets
+          cat > app/src/main/assets/index.html <<'__EOF__'
+          <!DOCTYPE html>
+          <html lang="en"><head><meta charset="utf-8">
+          <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+          <title>FPS & Hardware Monitor</title>
+          <style>
+          :root{--bg:#cfd3d9;--fg:#111;--bar:#e6e8ec;box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}
+          @media(prefers-color-scheme:dark){:root:not([data-theme="light"]){--bg:#17191c;--fg:#ddd;--bar:#23262a}}
+          :root[data-theme="dark"]{--bg:#17191c;--fg:#ddd;--bar:#23262a}
+          html{scroll-padding-top:env(safe-area-inset-top,0px)}
+          html,body{height:100%;margin:0;overflow:hidden}
+          body{display:flex;flex-direction:column;background:var(--bg);color:var(--fg);font:12px Tahoma,"Segoe UI",Verdana,sans-serif;user-select:none;-webkit-user-select:none}
+          [hidden]{display:none!important}
+          #d{flex:1;position:relative;overflow:hidden;min-height:0}
+          #bar{display:flex;flex-wrap:wrap;gap:6px;align-items:center;padding:8px;background:var(--bar)}
+          #bar button{font:inherit;padding:7px 12px;border:1px solid #777;background:#333;color:#eee;border-radius:3px}
+          #bar button.on{background:#b3201a;border-color:#e44}
+          #bar small{flex-basis:100%;font-size:10px;opacity:.75}
+          .w{position:absolute;background:var(--wb);border:1px solid #666;box-shadow:0 6px 24px #0009;display:flex;flex-direction:column;min-width:200px;min-height:140px}
+          .tb{background:#2b2b2b;color:#eee;padding:5px 8px;display:flex;justify-content:space-between;cursor:move;touch-action:none}
+          .tb b{cursor:pointer;padding:0 6px}
+          #G{flex:1;min-height:0;overflow-y:auto;display:flex;flex-direction:column}
+          .p{position:relative;flex:1 0 48px;border-top:1px solid #555}
+          .p canvas{position:absolute;left:0;top:0;width:100%;height:100%}
+          .h{position:absolute;left:28px;right:4px;top:1px;display:flex;gap:10px;color:#e0e0e0;font-size:11px;white-space:nowrap;overflow:hidden;pointer-events:none}
+          .h i{font-style:normal;color:#a0a0a0}
+          .gr{position:absolute;right:0;bottom:0;width:38px;height:38px;cursor:nwse-resize;touch-action:none;z-index:3;background:linear-gradient(135deg,transparent 50%,#aaa 50% 58%,transparent 58% 70%,#aaa 70% 78%,transparent 78%),#ffffff2e}
+          .o{position:absolute;z-index:5;padding:6px 12px 6px 10px;font:700 16px Unispace,Consolas,"Courier New",monospace;line-height:1.25;white-space:pre;text-shadow:1px 1px 0 #000,-1px -1px 0 #000,1px -1px 0 #000,-1px 1px 0 #000;border:1px dashed #fff4;cursor:move;touch-action:none}
+          .o{font-family:var(--of),Roboto,Arial,sans-serif;line-height:1.3}
+          #ot{display:grid;grid-template-columns:4.4em 3.35em 1.3em 3.4em 1.7em 3.6em 1.3em 3.9em 1em;align-items:baseline}
+          #ot div{white-space:nowrap}.n{text-align:right;padding-right:.12em}.u{font-size:.55em;align-self:start;padding-top:.45em}
+          .cb{color:var(--cb)}.cg{color:var(--cg)}.cf{color:var(--cf)}.v{color:var(--vo)}.f{color:var(--vw)}
+          .cf,.n.f{font-family:var(--ff),Roboto,Arial,sans-serif;font-size:calc(1em*var(--fz))}
+          #fr{position:relative;height:3.2em}.o:not(.g) #fr{display:none}#fr canvas{position:absolute;left:0;top:0;width:100%;height:100%}
+          #fl,#fm{position:absolute;top:0;font-size:.55em;z-index:1}#fl{left:0;color:var(--cf)}#fm{right:0;color:var(--vw)}
+          #S{position:absolute;inset:6px;z-index:9;overflow:auto;background:#1c1e22;color:#eee;border:1px solid #666;padding:8px 12px;font-size:13px}#S label{display:flex;justify-content:space-between;align-items:center;gap:10px;margin:8px 0}#S input[type=range]{flex:1;min-width:0}#S i{font-style:normal;min-width:3.2em;text-align:right}#S select,#S button{font:inherit}
+
+          html.ov,html.ov body{background:transparent}html.ov #bar,html.ov #W,html.ov #S{display:none!important}html.ov .o{border:0}html.ov .gr{display:none}
+          </style></head><body>
+          <div id=d>
+          <div class=w id=W><div class=tb><span>Hardware Monitor</span><b id=x>✕</b></div><div id=G></div><i class=gr></i></div>
+          <div class="o g" id=O><div id=ot></div><div id=fr><canvas id=fc></canvas><span id=fl>Frametime</span><span id=fm></span></div><i class=gr></i></div>
+          </div>
+          <div id=bar><button id=bm class=on>Monitor</button><button id=bo class=on>OSD</button><button id=bg class=on>OSD graph</button><button id=bs>Load test</button><button id=bf hidden>Float over apps</button><button id=bu hidden>Stop floating</button><button id=bc>⚙ Settings</button><small>Drag to move, drag the corner grip to resize. FPS and frametime are live for this page. “sim” readings are simulated: browsers can’t read real GPU/CPU usage.</small></div>
+          <script>
+          const OV=/overlay/.test(location.search);if(OV)document.documentElement.classList.add('ov');
+          const $=s=>document.querySelector(s),D=$('#d'),W=$('#W'),O=$('#O'),G=$('#G'),r=Math.round,cl=(v,a,b)=>Math.min(b,Math.max(a,v));
+          const M=[['fps','Framerate','FPS',0,'#ffe600'],['ft','Frametime','ms',50,'#ffe600'],['gu','GPU usage','%',100,'#00ff40',1],['gt','GPU temperature','°C',100,'#ff3b30',1],['gc','GPU core clock','MHz',3000,'#00e5ff',1],['gm','GPU memory clock','MHz',10000,'#00e5ff',1],['cu','CPU usage','%',100,'#00ff40',1],['ru','RAM usage','MB',16384,'#ff9f1a',1],['cc','CPU clock','MHz',6000,'#00e5ff',1],['ct','CPU temperature','°C',100,'#ff3b30',1],['cw','CPU power','W',150,'#ff9f1a',1],['gv','GPU VRAM usage','MB',8192,'#00ff40',1]];
+          const N=400,H={},mn={},mx={};
+          const DF={ivl:500,sm:40,an:1,fz:1,of:'Segoe UI',ff:'Segoe UI',osz:0,cn:'7600X',gn:'T400',cb:'#4392e0',cg:'#3fa96e',cf:'#cdaad7',vo:'#f69f21',vw:'#ffffff',fl:'#f0d0d6',bg:'#000000',gd:'#2a2a2a',col:{}};
+          M.forEach(m=>DF.col[m[0]]=m[4]);
+          let C=JSON.parse(JSON.stringify(DF));try{Object.assign(C,JSON.parse(localStorage.cfg2))}catch(e){}
+          const PH=()=>C.an?Math.min(1,(performance.now()-last)/C.ivl):1;
+          function crv(x,p){x.moveTo(p[0][0],p[0][1]);for(let i=1;i<p.length-1;i++)x.quadraticCurveTo(p[i][0],p[i][1],(p[i][0]+p[i+1][0])/2,(p[i][1]+p[i+1][1])/2);if(p.length>1)x.lineTo(p[p.length-1][0],p[p.length-1][1])}
+          M.forEach(m=>{const k=m[0],p=document.createElement('div');H[k]=[];mn[k]=1e9;mx[k]=-1e9;p.className='p';p.innerHTML=`<canvas></canvas><div class=h><span>${m[1]}, ${m[2]}${m[5]?' (sim)':''}</span><i></i></div>`;G.append(p);m.c=p.firstChild;m.r=p.querySelector('i')});
+          let fr=0,last=performance.now(),cnt=0,st=0;
+          const s={gu:55,cu:30,gt:48,gc:1800,gm:5001,ru:8200,cc:4800,ct:45,cw:35,gv:1300},wk=(v,t,k,n)=>v+(t-v)*k+(Math.random()-.5)*n;
+          const f=(k,v)=>k=='ft'?v.toFixed(1):r(v);
+          function draw(){
+           const q=devicePixelRatio||1,ph=PH();
+           M.forEach(m=>{
+            const k=m[0],cv=m.c,w=cv.clientWidth,h=cv.clientHeight;if(!w||!h)return;
+            if(cv.width!=r(w*q)||cv.height!=r(h*q)){cv.width=r(w*q);cv.height=r(h*q)}
+            const x=cv.getContext('2d'),a=H[k],max=m[3]||Math.ceil(Math.max(30,...a)*1.1/30)*30;
+            x.setTransform(q,0,0,q,0,0);x.fillStyle=C.bg;x.fillRect(0,0,w,h);
+            x.strokeStyle=C.gd;x.lineWidth=1;x.beginPath();
+            for(let i=1;i<4;i++){const y=r(h*i/4)+.5;x.moveTo(24,y);x.lineTo(w,y)}
+            for(let i=0;i*30<w;i++){const X=w-i*30-((cnt%10)+ph)*3;if(X>24){x.moveTo(X,0);x.lineTo(X,h)}}
+            x.stroke();
+            x.font='9px Tahoma,Verdana,sans-serif';x.fillStyle='#8a8a8a';x.textAlign='left';x.fillText(f(k,max),2,22);x.fillText('0',2,h-3);
+            const n=Math.min(a.length,Math.floor((w-26)/3)+2),b=a.length-n;if(!n)return;
+            x.strokeStyle=C.col[k];x.lineWidth=1.5;x.beginPath();
+            crv(x,a.slice(b).map((v,j)=>[w-3-(n-1-j)*3+(1-ph)*3,h-3-cl(v/max,0,1)*(h-8)]));
+            x.stroke();
+            const v=a[a.length-1];x.fillStyle=C.col[k];x.font='11px Tahoma,Verdana,sans-serif';x.textAlign='right';
+            x.fillText(f(k,v),w-5,cl(h-3-cl(v/max,0,1)*(h-8)-4,24,h-3));
+            m.r.textContent=`Min : ${f(k,mn[k])}  Max : ${f(k,mx[k])}`;
+           })}
+          function tick(){
+           const t=performance.now(),dt=t-last;last=t;if(!fr||dt<50)return;
+           const fps=fr*1000/dt;fr=0;cnt++;
+           s.gu=cl(wk(s.gu,st?98:55,.25,st?3:16),0,100);s.cu=cl(wk(s.cu,st?92:30,.25,st?4:10),0,100);
+           s.gt=wk(s.gt,32+s.gu*.42,.08,.6);s.gc=wk(s.gc,900+s.gu*10,.3,20);s.ru=wk(s.ru,8200+s.cu*8,.05,12);s.cc=wk(s.cc,4200+s.cu*12,.3,30);s.ct=wk(s.ct,34+s.cu*.3,.1,.4);s.cw=wk(s.cw,18+s.cu*.9,.2,1.5);s.gv=wk(s.gv,900+s.gu*5,.05,8);
+           const v={fps,ft:1000/fps,gu:s.gu,gt:s.gt,gc:s.gc,gm:s.gm,cu:s.cu,ru:s.ru,cc:s.cc,ct:s.ct,cw:s.cw,gv:s.gv};
+           for(const k in v){const a=H[k],p=a.length?a[a.length-1]:v[k],y=p+(v[k]-p)*(1-C.sm/100*.9);a.push(y);if(a.length>N)a.shift();mn[k]=Math.min(mn[k],y);mx[k]=Math.max(mx[k],y)}
+           draw();
+           {const so=FP.slice().sort((a,b)=>b-a),n=so.length;if(n){A.avg=1000*n/so.reduce((a,b)=>a+b,0);const k=Math.max(1,Math.ceil(n/100));A.low=1000*k/so.slice(0,k).reduce((a,b)=>a+b,0)}}
+           osd(1);
+          }
+          const FP=[],A={avg:0,low:0},OT=$('#ot'),FC=$('#fc'),FM=$('#fm'),fmt={cw:v=>v.toFixed(1)};let pf=performance.now();
+          const OR=[['cn','cb',[['cu','%'],['cc','MHz'],['ct','°C'],['cw','W']]],['RAM','cb',[['ru','MB']]],['gn','cg',[['gu','%'],['gc','MHz'],['gt','°C']]],['VRAM','cg',[['gv','MB'],['gm','MHz']]],['FPS','cf',[['fps','FPS']],1],['AVG','cf',[['avg','FPS']],1],['1% Low','cf',[['low','FPS']],1]];
+          OR.forEach(o=>{const l=document.createElement('div');l.className='l '+o[1];OT.append(l);o.l=l;o.c=[];for(let i=0;i<4;i++){const n=document.createElement('div'),u=document.createElement('div'),k=o[3]?'f':'v';n.className='n '+k;u.className='u '+k;OT.append(n,u);o.c.push([n,u])}});
+          function osd(u){
+           if(!H.fps.length)return;
+           if(u){
+            const g=k=>k=='avg'||k=='low'?A[k]:H[k][H[k].length-1];
+            OR.forEach(o=>{o.l.textContent=C[o[0]]||o[0];o[2].forEach((c,i)=>{o.c[i][0].textContent=(fmt[c[0]]||r)(g(c[0]));o.c[i][1].textContent=c[1]})});
+            FM.textContent=H.ft[H.ft.length-1].toFixed(1)+' ms'}
+           const q=devicePixelRatio||1,w=FC.clientWidth,h=FC.clientHeight;if(!w||!h)return;
+           if(FC.width!=r(w*q)||FC.height!=r(h*q)){FC.width=r(w*q);FC.height=r(h*q)}
+           const x=FC.getContext('2d'),n=Math.min(FP.length,Math.floor(w/2)),b=FP.slice(-n),Y=v=>h-2-Math.min(v/50,1)*(h-6),sp=2.2*(1000/(A.avg||60));
+           x.setTransform(q,0,0,q,0,0);x.clearRect(0,0,w,h);if(!n)return;
+           x.strokeStyle=C.fl;x.lineWidth=1.2;x.beginPath();
+           b.forEach((v,j)=>{const X=w-(n-1-j)*2;j?x.lineTo(X,Y(v)):x.moveTo(X,Y(v))});x.stroke();
+           x.strokeStyle='#ff3b3b';x.beginPath();
+           b.forEach((v,j)=>{if(v>sp){const X=w-(n-1-j)*2;x.moveTo(X,h-2);x.lineTo(X,Y(v))}});x.stroke()}
+          (function L(){fr++;const tn=performance.now();FP.push(tn-pf);pf=tn;if(FP.length>2000)FP.shift();if(st){const t=performance.now();while(performance.now()-t<22);}if(C.an&&H.fps.length){draw();osd()}requestAnimationFrame(L)})();
+          let tm;const rs=()=>{clearInterval(tm);tm=setInterval(tick,C.ivl)};
+          function sv(){C.pos=[O.offsetLeft,O.offsetTop,O.offsetWidth,W.offsetLeft,W.offsetTop,W.offsetWidth,W.offsetHeight];try{localStorage.cfg2=JSON.stringify(C)}catch(e){}}
+          function mv(el,hd,gr,fixH,cb){
+           hd.onpointerdown=e=>{if(e.target.id=='x')return;const ox=e.clientX-el.offsetLeft,oy=e.clientY-el.offsetTop;hd.setPointerCapture(e.pointerId);
+            hd.onpointermove=e=>{el.style.left=cl(e.clientX-ox,40-el.offsetWidth,D.clientWidth-40)+'px';el.style.top=cl(e.clientY-oy,0,D.clientHeight-30)+'px'};
+            hd.onpointerup=hd.onpointercancel=()=>{hd.onpointermove=null;sv()}};
+           gr.onpointerdown=e=>{e.stopPropagation();const w=el.offsetWidth,h=el.offsetHeight,X=e.clientX,Y=e.clientY;gr.setPointerCapture(e.pointerId);
+            gr.onpointermove=e=>{el.style.width=Math.max(fixH?110:200,w+e.clientX-X)+'px';if(!fixH)el.style.height=Math.max(140,h+e.clientY-Y)+'px';cb&&cb()};
+            gr.onpointerup=gr.onpointercancel=()=>{gr.onpointermove=null;sv()}};
+          }
+          const fs=()=>{const k=Math.max(8,(O.offsetWidth-24)/26);O.style.fontSize=k+'px';C.osz=r(k)};
+          mv(W,W.querySelector('.tb'),W.querySelector('.gr'));
+          mv(O,O,O.querySelector('.gr'),1,fs);
+          const dw=D.clientWidth,ww=Math.min(dw-16,440);
+          Object.assign(W.style,{left:(dw-ww)/2+'px',top:'160px',width:ww+'px',height:Math.max(200,Math.min(D.clientHeight-170,560))+'px'});
+          Object.assign(O.style,{left:'8px',top:'8px',width:Math.min(dw-16,620)+'px'});fs();W.style.top=O.offsetHeight+16+'px';W.style.height=Math.max(200,Math.min(D.clientHeight-O.offsetHeight-26,560))+'px';
+          if(OV){W.hidden=true;const f2=()=>{O.style.left='4px';O.style.top='4px';O.style.width=innerWidth-8+'px';fs()};f2();addEventListener('resize',f2)}
+          if(!OV&&C.pos&&C.pos.length==7){const p=C.pos;O.style.left=cl(p[0],0,D.clientWidth-60)+'px';O.style.top=cl(p[1],0,D.clientHeight-40)+'px';O.style.width=p[2]+'px';W.style.left=cl(p[3],0,D.clientWidth-60)+'px';W.style.top=cl(p[4],0,D.clientHeight-40)+'px';W.style.width=p[5]+'px';W.style.height=p[6]+'px';fs()}
+          const tg=(e,b)=>{e.hidden=!e.hidden;b.classList.toggle('on',!e.hidden);draw()};
+          $('#bm').onclick=$('#x').onclick=()=>tg(W,$('#bm'));
+          $('#bo').onclick=()=>tg(O,$('#bo'));
+          $('#bg').onclick=e=>e.target.classList.toggle('on',O.classList.toggle('g'));
+          $('#bs').onclick=e=>{st=!st;e.target.classList.toggle('on',st);e.target.textContent=st?'Load test: ON':'Load test'};
+          new ResizeObserver(draw).observe(G);
+          if(window.Android&&!OV){$('#bf').hidden=false;$('#bu').hidden=false;$('#bf').onclick=()=>Android.start();$('#bu').onclick=()=>Android.stop()}
+          const S=document.createElement('div');S.id='S';S.hidden=true;D.append(S);
+          const FN=['Segoe UI','Roboto','Arial','Bahnschrift','monospace','sans-serif','sans-serif-condensed','serif','cursive','Consolas','Courier New','Tahoma','Verdana','Impact','Georgia','Trebuchet MS'];
+          let hh='<label><b>Settings</b><span><button id=sr>Reset</button> <button id=sx>Close</button></span></label>';
+          const lb=(t,i)=>hh+=`<label>${t}${i}</label>`;
+          [['Update interval (ms)','ivl',100,2000,50],['Graph smoothing (%)','sm',0,95,5],['FPS text size (x)','fz',1,3,.25],['OSD size','osz',8,48,1]].forEach(a=>lb(a[0],`<input type=range data-k=${a[1]} min=${a[2]} max=${a[3]} step=${a[4]}><i></i>`));
+          lb('Smooth scrolling','<input type=checkbox data-k=an>');
+          [['CPU label','cn'],['GPU label','gn']].forEach(a=>lb(a[0],`<input type=text size=8 data-k=${a[1]}>`));
+          [['OSD font','of'],['FPS font','ff']].forEach(a=>lb(a[0],`<select data-k=${a[1]}>${FN.map(f=>`<option>${f}</option>`).join('')}</select>`));
+          [['CPU/RAM label','cb'],['GPU/VRAM label','cg'],['FPS label','cf'],['Value color','vo'],['FPS value color','vw'],['Frametime line','fl'],['Graph background','bg'],['Grid lines','gd']].forEach(a=>lb(a[0],`<input type=color data-k=${a[1]}>`));
+          M.forEach(m=>lb(m[1]+' line',`<input type=color data-k=${m[0]} data-c=1>`));
+          S.innerHTML=hh;
+          const fill=()=>S.querySelectorAll('[data-k]').forEach(i=>{const k=i.dataset.k,v=i.dataset.c?C.col[k]:C[k];if(i.type=='checkbox')i.checked=!!v;else i.value=v;if(i.nextSibling&&i.nextSibling.tagName=='I')i.nextSibling.textContent=v});
+          function ap(){const e=document.documentElement.style;[['cb',C.cb],['cg',C.cg],['cf',C.cf],['vo',C.vo],['vw',C.vw],['wb',C.bg],['of',C.of],['ff',C.ff],['fz',C.fz]].forEach(a=>e.setProperty('--'+a[0],a[1]));rs();try{localStorage.cfg2=JSON.stringify(C)}catch(x){}draw();osd(1)}
+          S.oninput=e=>{const t=e.target,k=t.dataset.k;if(!k)return;const v=t.type=='checkbox'?+t.checked:t.type=='range'?+t.value:t.value;if(t.dataset.c)C.col[k]=v;else C[k]=v;if(k=='osz'){O.style.width=r(v*26+24)+'px';fs();sv()}if(t.nextSibling&&t.nextSibling.tagName=='I')t.nextSibling.textContent=v;ap()};
+          $('#bc').onclick=()=>{S.hidden=!S.hidden;fill()};$('#sx').onclick=()=>S.hidden=true;
+          $('#sr').onclick=()=>{C=JSON.parse(JSON.stringify(DF));fill();ap()};
+          fill();ap();
+          </script></body></html>
+          __EOF__
+      - name: Build APK
+        run: gradle assembleDebug --no-daemon
+      - uses: actions/upload-artifact@v4
+        with:
+          name: FPSMonitor-Overlay-APK
+          path: app/build/outputs/apk/debug/app-debug.apk
